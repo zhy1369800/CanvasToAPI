@@ -650,6 +650,8 @@
             this.reconnectDelay = 5000;
             this.reconnectAttempts = 0;
             this.reconnectTimer = null;
+            this.heartbeatTimer = null;
+            this.isRetrying401 = false;
             this.manualDisconnect = false;
             this.shouldReconnect = true;
         }
@@ -707,6 +709,7 @@
                     this.socket.addEventListener("close", () => {
                         this.isConnected = false;
                         this.isAuthenticated = false;
+                        this.stopHeartbeat();
                         const shouldAutoReconnect = !this.manualDisconnect && this.shouldReconnect;
                         const closeMessage = this.manualDisconnect
                             ? "Connection closed by user."
@@ -736,6 +739,13 @@
                     this.socket.addEventListener("message", event => {
                         try {
                             const payload = JSON.parse(event.data);
+                            
+                            // Handle heartbeats (pong)
+                            if (payload?.type === "pong") {
+                                // Logger.debug("Heartbeat synchronized with server");
+                                return;
+                            }
+
                             if (payload?.event_type === "auth_ack") {
                                 if (payload.authorized) {
                                     this.isConnected = true;
@@ -743,6 +753,7 @@
                                     this.reconnectAttempts = 0;
                                     Logger.output("Connection authenticated successfully!");
                                     setStatus("connected");
+                                    this.startHeartbeat();
                                     this.dispatchEvent(new CustomEvent("connected"));
                                     if (!settled) {
                                         settled = true;
@@ -784,9 +795,26 @@
         disconnect() {
             this.manualDisconnect = true;
             this.shouldReconnect = false;
+            this.stopHeartbeat();
             this.reset();
             if (this.socket) {
                 this.socket.close();
+            }
+        }
+
+        startHeartbeat() {
+            this.stopHeartbeat();
+            this.heartbeatTimer = setInterval(() => {
+                if (this.isConnected && this.socket && this.socket.readyState === WebSocket.OPEN) {
+                    this.socket.send(JSON.stringify({ type: "ping", timestamp: Date.now() }));
+                }
+            }, 30000);
+        }
+
+        stopHeartbeat() {
+            if (this.heartbeatTimer) {
+                clearInterval(this.heartbeatTimer);
+                this.heartbeatTimer = null;
             }
         }
 
@@ -906,7 +934,19 @@
                     const requestUrl = this._constructUrl(requestSpec);
                     const requestConfig = this._buildRequestConfig(requestSpec, abortController.signal);
 
-                    const response = await fetch(requestUrl, requestConfig);
+                    let response = await fetch(requestUrl, requestConfig);
+
+                    if (response.status === 401 && !this.isRetrying401) {
+                        this.isRetrying401 = true;
+                        Logger.warn("Detect 401 error, attempting to re-authenticate and retry...");
+                        this._sendAuthMessage();
+                        await new Promise(resolve => setTimeout(resolve, 800));
+                        response = await fetch(requestUrl, requestConfig);
+                        this.isRetrying401 = false;
+                        if (response.ok) {
+                            Logger.output("Retry successful after 401 re-authentication!");
+                        }
+                    }
 
                     if (!response.ok) {
                         const errorBody = await response.text();
@@ -991,6 +1031,7 @@
                 headers: this._sanitizeHeaders(requestSpec.headers),
                 method: requestSpec.method,
                 signal,
+                credentials: "include",
             };
 
             if (["POST", "PUT", "PATCH"].includes(requestSpec.method)) {

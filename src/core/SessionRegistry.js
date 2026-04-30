@@ -365,6 +365,16 @@ class SessionRegistry extends EventEmitter {
                 return;
             }
 
+            // Handle heartbeats (ping)
+            if (parsedMessage.type === "ping") {
+                try {
+                    connection.ws.send(JSON.stringify({ timestamp: Date.now(), type: "pong" }));
+                } catch (e) {
+                    this.logger.error(`[Session] Failed to send pong to ${connectionId}: ${e.message}`);
+                }
+                return;
+            }
+
             if (!connection.authenticated) {
                 this.logger.warn(
                     `[Auth] Ignoring non-auth message from unauthenticated browser ${this.formatConnectionLabel(connectionId)}`
