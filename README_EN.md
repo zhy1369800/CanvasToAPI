@@ -156,12 +156,6 @@ If you need to access the service through a domain name or put it behind a rever
 >
 > 📖 For detailed Nginx configuration instructions, see: [Nginx Reverse Proxy Configuration](docs/en/nginx-setup.md)
 
-### 🐾 Claw Cloud Run Deployment
-
-Deploy directly on Claw Cloud Run, a fully managed container platform.
-
-> 📖 For detailed deployment instructions, see: [Deploy on Claw Cloud Run](docs/en/claw-cloud-run.md)
-
 ## 📗 API Usage
 
 ### 🤖 OpenAI-Compatible API
@@ -169,7 +163,6 @@ Deploy directly on Claw Cloud Run, a fully managed container platform.
 - `GET /v1/models`: List models.
 - `POST /v1/chat/completions`: Chat completion and image generation, supports non-streaming, real streaming, and fake streaming.
 - `POST /v1/responses`: OpenAI Responses API compatible endpoint for conversation generation, does not support image generation, and supports non-streaming, real streaming, and fake streaming.
-- `POST /v1/responses/input_tokens`: Count input tokens for an OpenAI Responses API request.
 
 ### ♊ Gemini Native API Format
 
@@ -181,7 +174,6 @@ Deploy directly on Claw Cloud Run, a fully managed container platform.
 
 - `GET /v1/models`: List models.
 - `POST /v1/messages`: Chat message completions, supports non-streaming, real streaming, and fake streaming.
-- `POST /v1/messages/count_tokens`: Count tokens in messages.
 
 > 📖 For detailed API usage examples, see: [API Usage Examples](docs/en/api-examples.md)
 
