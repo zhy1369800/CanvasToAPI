@@ -51,6 +51,76 @@ class FormatConverter {
         verse: "Puck",
     };
 
+    // OpenAI input_audio.format -> MIME type mapping
+    static INPUT_AUDIO_FORMAT_MIME_MAP = {
+        aac: "audio/aac",
+        flac: "audio/flac",
+        m4a: "audio/mp4",
+        mp3: "audio/mpeg",
+        ogg: "audio/ogg",
+        opus: "audio/ogg",
+        wav: "audio/wav",
+        webm: "audio/webm",
+    };
+
+    // File extensions decoded to UTF-8 text instead of sent as binary inlineData
+    // (also prevents mime-types from misclassifying .ts as video/mp2t)
+    static TEXT_FILE_EXTENSIONS = new Set([
+        "c",
+        "cc",
+        "cfg",
+        "conf",
+        "cpp",
+        "cs",
+        "css",
+        "csv",
+        "env",
+        "go",
+        "h",
+        "hpp",
+        "htm",
+        "html",
+        "ini",
+        "java",
+        "js",
+        "json",
+        "jsx",
+        "kt",
+        "less",
+        "log",
+        "lua",
+        "md",
+        "mjs",
+        "php",
+        "py",
+        "rb",
+        "rs",
+        "sass",
+        "scss",
+        "sh",
+        "sql",
+        "svg",
+        "swift",
+        "toml",
+        "ts",
+        "tsx",
+        "txt",
+        "vue",
+        "xml",
+        "yaml",
+        "yml",
+    ]);
+
+    static TEXT_APPLICATION_MIME_TYPES = new Set([
+        "application/javascript",
+        "application/json",
+        "application/toml",
+        "application/x-javascript",
+        "application/x-yaml",
+        "application/xml",
+        "application/yaml",
+    ]);
+
     /**
      * Parse streaming mode suffix from model name.
      * Only supports the LAST hyphen token: `-real` or `-fake` (case-insensitive).
@@ -134,6 +204,243 @@ class FormatConverter {
         }
 
         return null;
+    }
+
+    _extractFileExtension(filename) {
+        if (typeof filename !== "string" || !filename.trim()) {
+            return "";
+        }
+        const cleanName = filename.trim().split("?")[0].split("#")[0];
+        const dotIndex = cleanName.lastIndexOf(".");
+        if (dotIndex <= 0 || dotIndex === cleanName.length - 1) {
+            return "";
+        }
+        return cleanName.slice(dotIndex + 1).toLowerCase();
+    }
+
+    _extractFilenameFromUrl(url) {
+        try {
+            const parsed = new URL(url);
+            const segments = parsed.pathname.split("/").filter(Boolean);
+            return segments.length > 0 ? decodeURIComponent(segments[segments.length - 1]) : "";
+        } catch {
+            return "";
+        }
+    }
+
+    _isTextLikeFile(mimeType, filename) {
+        const ext = this._extractFileExtension(filename);
+        if (ext && FormatConverter.TEXT_FILE_EXTENSIONS.has(ext)) {
+            return true;
+        }
+
+        const baseMime = typeof mimeType === "string" ? mimeType.split(";")[0].trim().toLowerCase() : "";
+        if (!baseMime) {
+            return false;
+        }
+
+        return baseMime.startsWith("text/") || FormatConverter.TEXT_APPLICATION_MIME_TYPES.has(baseMime);
+    }
+
+    _buildGeminiPartFromFileBytes({ base64Data, filename, mimeType }) {
+        const cleanMime = typeof mimeType === "string" ? mimeType.split(";")[0].trim().toLowerCase() : "";
+        if (this._isTextLikeFile(cleanMime, filename)) {
+            const textContent = Buffer.from(base64Data, "base64").toString("utf8");
+            return {
+                text: filename ? `[File: ${filename}]\n${textContent}` : textContent,
+            };
+        }
+
+        const lookedUpMime = filename ? mime.lookup(filename) : "";
+        const resolvedMime =
+            (cleanMime && cleanMime !== "application/octet-stream" ? cleanMime : "") ||
+            lookedUpMime ||
+            cleanMime ||
+            "application/octet-stream";
+
+        return {
+            inlineData: {
+                data: base64Data,
+                mimeType: resolvedMime,
+            },
+        };
+    }
+
+    async _convertFileInputToGooglePart({ fileData, fileId, filename, fileUrl, mimeType: explicitMimeType } = {}) {
+        const cleanFilename = typeof filename === "string" ? filename.trim() : "";
+        const trimmedData = typeof fileData === "string" ? fileData.trim() : "";
+        const trimmedUrl = typeof fileUrl === "string" ? fileUrl.trim() : "";
+
+        if (trimmedData.startsWith("data:")) {
+            const match = trimmedData.match(/^data:([^;,]+)?(?:;[^,]*)?;base64,([\s\S]+)$/i);
+            const cleanBase64 = match ? match[2].replace(/\s+/g, "") : "";
+            if (!cleanBase64) {
+                this.logger.warn("[Adapter] Skipping file input because data URL format was unsupported.");
+                return {
+                    text: "[System Note: Skipped a file input because file_data URL format was unsupported]",
+                };
+            }
+            return this._buildGeminiPartFromFileBytes({
+                base64Data: cleanBase64,
+                filename: cleanFilename,
+                mimeType: match[1] || explicitMimeType || "",
+            });
+        }
+
+        const targetUrl = /^https?:\/\//i.test(trimmedUrl)
+            ? trimmedUrl
+            : /^https?:\/\//i.test(trimmedData)
+              ? trimmedData
+              : "";
+
+        if (targetUrl) {
+            try {
+                this.logger.info(`[Adapter] Downloading file from URL: ${targetUrl}`);
+                const response = await axios.get(targetUrl, {
+                    responseType: "arraybuffer",
+                });
+                const fileBuffer = Buffer.from(response.data);
+                const base64Data = fileBuffer.toString("base64");
+                const headerMime =
+                    typeof response.headers?.["content-type"] === "string"
+                        ? response.headers["content-type"].split(";")[0].trim().toLowerCase()
+                        : "";
+                const resolvedFilename = cleanFilename || this._extractFilenameFromUrl(targetUrl);
+                const fallbackMime =
+                    explicitMimeType ||
+                    (resolvedFilename ? mime.lookup(resolvedFilename) : "") ||
+                    mime.lookup(targetUrl.split("?")[0]) ||
+                    "";
+                const resolvedMime =
+                    headerMime && headerMime !== "application/octet-stream" ? headerMime : fallbackMime || headerMime;
+
+                this.logger.info("[Adapter] Successfully downloaded and processed file input.");
+                return this._buildGeminiPartFromFileBytes({
+                    base64Data,
+                    filename: resolvedFilename,
+                    mimeType: resolvedMime,
+                });
+            } catch (error) {
+                this.logger.error(`[Adapter] Failed to download or process file from URL: ${targetUrl}`, error);
+                return { text: `[System Note: Failed to load file from ${targetUrl}]` };
+            }
+        }
+
+        if (trimmedData) {
+            const cleanBase64 = trimmedData.replace(/\s+/g, "");
+            const resolvedMime =
+                explicitMimeType || (cleanFilename ? mime.lookup(cleanFilename) : "") || "application/octet-stream";
+            return this._buildGeminiPartFromFileBytes({
+                base64Data: cleanBase64,
+                filename: cleanFilename,
+                mimeType: resolvedMime,
+            });
+        }
+
+        if (typeof fileId === "string" && fileId.trim()) {
+            this.logger.warn(
+                `[Adapter] Skipping file input referencing unsupported file_id="${fileId.trim()}". Inline file_data or file_url is required.`
+            );
+            return {
+                text: "[System Note: Skipped file input because file_id references are not supported; please provide inline file_data or file_url]",
+            };
+        }
+
+        this.logger.warn("[Adapter] Skipping file input because no valid file_data or file_url was provided.");
+        return {
+            text: "[System Note: Skipped file input because no valid file_data or file_url was provided]",
+        };
+    }
+
+    async _convertOpenAIFilePartToGooglePart(filePart) {
+        const fileObj = filePart?.file && typeof filePart.file === "object" ? filePart.file : filePart || {};
+        return this._convertFileInputToGooglePart({
+            fileData: fileObj.file_data,
+            fileId: fileObj.file_id,
+            filename: fileObj.filename,
+            fileUrl: fileObj.file_url || fileObj.url,
+            mimeType: fileObj.mime_type,
+        });
+    }
+
+    _convertInputAudioToGooglePart(audioPart) {
+        const audioObj =
+            audioPart?.input_audio && typeof audioPart.input_audio === "object"
+                ? audioPart.input_audio
+                : audioPart || {};
+        const rawData = typeof audioObj.data === "string" ? audioObj.data.trim() : "";
+        const format = typeof audioObj.format === "string" ? audioObj.format.trim().toLowerCase() : "";
+
+        if (!rawData) {
+            this.logger.warn("[Adapter] Skipping input_audio part because no audio data was provided.");
+            return {
+                text: "[System Note: Skipped audio input because no valid audio data was provided]",
+            };
+        }
+
+        const fallbackMime =
+            FormatConverter.INPUT_AUDIO_FORMAT_MIME_MAP[format] || (format ? mime.lookup(format) : "") || "audio/mpeg";
+
+        if (rawData.startsWith("data:")) {
+            const match = rawData.match(/^data:([^;,]+)?(?:;[^,]*)?;base64,([\s\S]+)$/i);
+            const cleanBase64 = match ? match[2].replace(/\s+/g, "") : "";
+            if (!cleanBase64) {
+                this.logger.warn("[Adapter] Skipping input_audio part because data URL format was unsupported.");
+                return {
+                    text: "[System Note: Skipped audio input because audio data URL format was unsupported]",
+                };
+            }
+            return {
+                inlineData: {
+                    data: cleanBase64,
+                    mimeType: match[1] || fallbackMime,
+                },
+            };
+        }
+
+        return {
+            inlineData: {
+                data: rawData.replace(/\s+/g, ""),
+                mimeType: fallbackMime,
+            },
+        };
+    }
+
+    async _convertClaudeDocumentToGooglePart(block) {
+        const source = block?.source && typeof block.source === "object" ? block.source : null;
+        const filename =
+            typeof block?.title === "string" && block.title.trim()
+                ? block.title.trim()
+                : typeof block?.name === "string"
+                  ? block.name.trim()
+                  : "";
+
+        if (source?.type === "text" && typeof source.data === "string") {
+            return {
+                text: filename ? `[File: ${filename}]\n${source.data}` : source.data,
+            };
+        }
+
+        if (source?.type === "base64" && typeof source.data === "string") {
+            return this._convertFileInputToGooglePart({
+                fileData: source.data,
+                filename,
+                mimeType: source.media_type,
+            });
+        }
+
+        if (source?.type === "url" && typeof source.url === "string") {
+            return this._convertFileInputToGooglePart({
+                filename,
+                fileUrl: source.url,
+                mimeType: source.media_type,
+            });
+        }
+
+        this.logger.warn("[Adapter] Skipping Claude document block with unsupported source.");
+        return {
+            text: "[System Note: Skipped unsupported Claude document block]",
+        };
     }
 
     /**
@@ -688,6 +995,10 @@ class FormatConverter {
                                 text: "[System Note: Skipped an image input because image_url format was unsupported]",
                             });
                         }
+                    } else if (part.type === "file") {
+                        googleParts.push(await this._convertOpenAIFilePartToGooglePart(part));
+                    } else if (part.type === "input_audio") {
+                        googleParts.push(this._convertInputAudioToGooglePart(part));
                     }
                 }
             }
@@ -2105,6 +2416,8 @@ class FormatConverter {
                                         mimeType: block.source.media_type,
                                     },
                                 });
+                            } else if (block.type === "document") {
+                                googleParts.push(await this._convertClaudeDocumentToGooglePart(block));
                             }
                         }
                     }
@@ -2189,6 +2502,8 @@ class FormatConverter {
                                     });
                                 }
                             }
+                        } else if (block.type === "document") {
+                            googleParts.push(await this._convertClaudeDocumentToGooglePart(block));
                         }
                     }
                 }
@@ -2987,10 +3302,10 @@ class FormatConverter {
                                             text: "[System Note: Skipped an image input because image_url format was unsupported]",
                                         });
                                     }
-                                } else if (contentPart.type === "input_file") {
-                                    this.logger.debug(
-                                        "[Adapter] input_file content detected but not supported by Gemini, skipping..."
-                                    );
+                                } else if (contentPart.type === "input_file" || contentPart.type === "file") {
+                                    googleParts.push(await this._convertOpenAIFilePartToGooglePart(contentPart));
+                                } else if (contentPart.type === "input_audio") {
+                                    googleParts.push(this._convertInputAudioToGooglePart(contentPart));
                                 }
                             }
                         }
