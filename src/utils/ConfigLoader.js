@@ -19,6 +19,7 @@ class ConfigLoader {
             apiKeys: [],
             apiKeySource: "Not set",
             browserWsPath: "/ws",
+            edgeTtsDefaultVoice: "zh-CN-XiaoxiaoNeural",
             forceThinking: false,
             forceUrlContext: false,
             forceWebSearch: false,
@@ -30,6 +31,7 @@ class ConfigLoader {
             sessionSelectionStrategy: "round",
             sharePageUrl: loadGeminiShareUrl(this.logger),
             streamingMode: "fake",
+            ttsProvider: "edge",
         };
 
         if (process.env.PORT) {
@@ -93,6 +95,24 @@ class ConfigLoader {
             config.forceUrlContext = process.env.FORCE_URL_CONTEXT.toLowerCase() === "true";
         }
 
+        if (process.env.TTS_PROVIDER) {
+            const provider = String(process.env.TTS_PROVIDER).trim().toLowerCase();
+            if (provider === "edge" || provider === "gemini") {
+                config.ttsProvider = provider;
+            } else {
+                this.logger.warn(
+                    `[Config] Invalid TTS_PROVIDER="${process.env.TTS_PROVIDER}", using ${config.ttsProvider}.`
+                );
+            }
+        }
+
+        if (process.env.EDGE_TTS_DEFAULT_VOICE) {
+            const voice = String(process.env.EDGE_TTS_DEFAULT_VOICE).trim();
+            if (voice) {
+                config.edgeTtsDefaultVoice = voice;
+            }
+        }
+
         if (Array.isArray(config.apiKeys)) {
             config.apiKeys = config.apiKeys.map(key => String(key).trim()).filter(Boolean);
         } else {
@@ -153,6 +173,8 @@ class ConfigLoader {
         this.logger.info(`  Force Thinking: ${config.forceThinking}`);
         this.logger.info(`  Force Web Search: ${config.forceWebSearch}`);
         this.logger.info(`  Force URL Context: ${config.forceUrlContext}`);
+        this.logger.info(`  TTS Provider: ${config.ttsProvider}`);
+        this.logger.info(`  Edge-TTS Default Voice: ${config.edgeTtsDefaultVoice}`);
         this.logger.info(`  Max Retries per Request: ${config.maxRetries} times`);
         this.logger.info(`  Retry Delay: ${config.retryDelay}ms`);
         this.logger.info(`  Gemini Share Page: ${config.sharePageUrl || "Not configured"}`);

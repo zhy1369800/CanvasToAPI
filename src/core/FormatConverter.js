@@ -36,6 +36,21 @@ class FormatConverter {
         minimal: "MINIMAL",
     };
 
+    // OpenAI TTS voice -> Gemini prebuilt voice mapping
+    static OPENAI_VOICE_TO_GEMINI_MAP = {
+        alloy: "Kore",
+        ash: "Orus",
+        ballad: "Leda",
+        coral: "Callirrhoe",
+        echo: "Puck",
+        fable: "Aoede",
+        nova: "Leda",
+        onyx: "Charon",
+        sage: "Fenrir",
+        shimmer: "Zephyr",
+        verse: "Puck",
+    };
+
     /**
      * Parse streaming mode suffix from model name.
      * Only supports the LAST hyphen token: `-real` or `-fake` (case-insensitive).
@@ -3230,6 +3245,80 @@ class FormatConverter {
         this._finalizeGoogleRequest(googleRequest);
         this.logger.info("[Adapter] OpenAI Response API to Google translation complete.");
         return { cleanModelName, googleRequest, modelStreamingMode };
+    }
+
+    /**
+     * Resolve default Gemini TTS model from loaded configuration or fallback.
+     * @returns {string}
+     */
+    _resolveDefaultTtsModel() {
+        const modelList = this.serverSystem?.config?.modelList;
+        if (Array.isArray(modelList)) {
+            const matched = modelList.find(m => m?.name && String(m.name).toLowerCase().includes("tts"));
+            if (matched) {
+                return String(matched.name).replace(/^models\//, "");
+            }
+        }
+        return "gemini-2.5-flash-preview-tts";
+    }
+
+    /**
+     * Convert OpenAI /v1/audio/speech request body to Gemini TTS generateContent payload.
+     * @param {object} openaiBody - OpenAI speech request body
+     * @returns {{ cleanModelName: string, geminiVoice: string, googleRequest: object, responseFormat: string }}
+     */
+    translateOpenAISpeechToGoogle(openaiBody) {
+        if (!openaiBody || typeof openaiBody.input !== "string" || openaiBody.input.trim().length === 0) {
+            const error = new Error("Invalid request: 'input' must be a non-empty string.");
+            error.status = 400;
+            throw error;
+        }
+
+        const rawModel = typeof openaiBody.model === "string" ? openaiBody.model.trim().replace(/^models\//, "") : "";
+        const { cleanModelName: streamStrippedModel } = FormatConverter.parseModelStreamingModeSuffix(rawModel);
+        const { cleanModelName: candidateModel } = FormatConverter.parseModelThinkingLevel(streamStrippedModel);
+        const lowerCandidate = (candidateModel || "").toLowerCase();
+        const isOpenAITtsAlias = ["gpt-4o-mini-tts", "tts-1", "tts-1-hd"].includes(lowerCandidate);
+        const cleanModelName =
+            lowerCandidate.includes("tts") && !isOpenAITtsAlias ? candidateModel : this._resolveDefaultTtsModel();
+
+        const rawVoice = typeof openaiBody.voice === "string" ? openaiBody.voice.trim() : "";
+        const mappedVoice = rawVoice ? FormatConverter.OPENAI_VOICE_TO_GEMINI_MAP[rawVoice.toLowerCase()] : null;
+        const geminiVoice = mappedVoice || rawVoice || "Kore";
+
+        const instructions = typeof openaiBody.instructions === "string" ? openaiBody.instructions.trim() : "";
+        const promptText = instructions ? `${instructions}:\n${openaiBody.input}` : openaiBody.input;
+
+        const googleRequest = {
+            contents: [
+                {
+                    parts: [{ text: promptText }],
+                    role: "user",
+                },
+            ],
+            generationConfig: {
+                responseModalities: ["AUDIO"],
+                speechConfig: {
+                    voiceConfig: {
+                        prebuiltVoiceConfig: {
+                            voiceName: geminiVoice,
+                        },
+                    },
+                },
+            },
+        };
+
+        const responseFormat =
+            typeof openaiBody.response_format === "string" && openaiBody.response_format.trim()
+                ? openaiBody.response_format.trim().toLowerCase()
+                : "mp3";
+
+        this.logger.info(
+            `[Adapter] Translated OpenAI TTS request: model="${rawModel || "(default)"}" -> "${cleanModelName}", ` +
+                `voice="${rawVoice || "(default)"}" -> "${geminiVoice}", format="${responseFormat}"`
+        );
+
+        return { cleanModelName, geminiVoice, googleRequest, responseFormat };
     }
 }
 

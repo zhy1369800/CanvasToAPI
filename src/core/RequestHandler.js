@@ -9,6 +9,8 @@
  * Request Handler Module (Refactored)
  * Main request handler that coordinates between other modules
  */
+const AudioConverter = require("../utils/AudioConverter");
+const EdgeTtsService = require("../utils/EdgeTtsService");
 const FormatConverter = require("./FormatConverter");
 const { isUserAbortedError } = require("../utils/CustomErrors");
 const { QueueClosedError, QueueTimeoutError } = require("../utils/MessageQueue");
@@ -774,6 +776,195 @@ class RequestHandler {
             this._handleRequestError(error, res);
         } finally {
             this.connectionRegistry.removeMessageQueue(requestId, "request_complete");
+            if (!res.writableEnded) res.end();
+        }
+    }
+
+    // Process OpenAI TTS (/v1/audio/speech) requests
+    async processOpenAISpeechRequest(req, res) {
+        if (!req.body || typeof req.body.input !== "string" || req.body.input.trim().length === 0) {
+            const message = "Invalid request: 'input' must be a non-empty string.";
+            this.logger.warn(`[Adapter] Invalid OpenAI TTS request: ${message}`);
+            return this._sendErrorResponse(res, 400, message);
+        }
+
+        const rawModel = typeof req.body.model === "string" ? req.body.model.trim().toLowerCase() : "";
+        let useEdgeTts;
+        if (rawModel.includes("gemini")) {
+            useEdgeTts = false;
+        } else if (rawModel.includes("edge")) {
+            useEdgeTts = true;
+        } else {
+            useEdgeTts = (this.config.ttsProvider || "edge") === "edge";
+        }
+
+        if (useEdgeTts) {
+            return this._handleEdgeTtsSpeechRequest(req, res);
+        }
+
+        const requestId = this._generateRequestId();
+        res.__proxyResponseStreamMode = null;
+
+        const selectedConnection = this._selectConnection();
+        if (!selectedConnection) {
+            this._sendErrorResponse(res, 503, "No browser session is currently connected.");
+            return;
+        }
+        const sessionId = selectedConnection.connectionId;
+
+        if (!this.connectionRegistry.getConnectionBySession(sessionId)) {
+            this.logger.warn(`[Request] No WebSocket connection for session ${this._describeSession(sessionId)}`);
+            const recovered = await this._handleBrowserRecovery(res, sessionId);
+            if (!recovered) return;
+        }
+
+        {
+            const ready = await this._waitForSystemAndConnectionIfBusy(res, sessionId);
+            if (!ready) return;
+        }
+
+        let cleanModelName, googleRequest, responseFormat;
+        try {
+            ({ cleanModelName, googleRequest, responseFormat } = this.formatConverter.translateOpenAISpeechToGoogle(
+                req.body
+            ));
+        } catch (error) {
+            this.logger.warn(`[Adapter] Invalid OpenAI TTS request: ${error.message}`);
+            return this._sendErrorResponse(res, error.status || 400, error.message);
+        }
+
+        const proxyRequest = {
+            body: JSON.stringify(googleRequest),
+            headers: { "Content-Type": "application/json" },
+            is_generative: true,
+            method: "POST",
+            path: `/v1beta/models/${cleanModelName}:generateContent`,
+            query_params: {},
+            request_id: requestId,
+            streaming_mode: "fake",
+        };
+        this._initializeProxyRequestAttempt(proxyRequest);
+
+        try {
+            const messageQueue = this.connectionRegistry.createMessageQueue(
+                requestId,
+                sessionId,
+                proxyRequest.request_attempt_id
+            );
+            this._setupClientDisconnectHandler(res, requestId, () => sessionId);
+
+            const result = await this._executeBufferedRequestWithRetries(proxyRequest, messageQueue, sessionId, {
+                timeout: this.timeouts.FAKE_STREAM,
+            });
+
+            if (!result.success) {
+                this._logFinalRequestFailure(result.error, "OpenAI TTS");
+                this._sendErrorResponse(res, result.error.status || 500, result.error.message);
+
+                if (result.error.skipSessionSwitch) {
+                    this.logger.info(
+                        "[Request] Immediate-switch retries exhausted, skipping additional session switch."
+                    );
+                } else if (this._isConnectionResetError(result.error)) {
+                    this.logger.info(
+                        "[Request] Failure due to connection reset (OpenAI TTS), skipping session switch."
+                    );
+                }
+                return;
+            }
+
+            let googleResponse;
+            try {
+                googleResponse = JSON.parse(result.bufferedBody);
+            } catch (parseError) {
+                this.logger.error(`[Adapter] Failed to parse Gemini TTS response JSON: ${parseError.message}`);
+                return this._sendErrorResponse(res, 502, "Failed to parse backend TTS response.");
+            }
+
+            const candidate = googleResponse?.candidates?.[0];
+            const parts = Array.isArray(candidate?.content?.parts) ? candidate.content.parts : [];
+            const audioParts = parts
+                .filter(part => {
+                    if (!part?.inlineData?.data) return false;
+                    const mimeType = String(part.inlineData.mimeType || "").toLowerCase();
+                    return !mimeType || mimeType.startsWith("audio/");
+                })
+                .map(part => ({
+                    data: part.inlineData.data,
+                    mimeType: part.inlineData.mimeType,
+                }));
+
+            if (audioParts.length === 0) {
+                const finishReason = candidate?.finishReason || "UNKNOWN";
+                const textSummary = parts
+                    .filter(p => typeof p?.text === "string" && p.text.trim())
+                    .map(p => p.text.trim())
+                    .join(" ")
+                    .slice(0, 200);
+                this.logger.warn(
+                    `[Adapter] Gemini TTS response contained no audio inlineData (finishReason=${finishReason}` +
+                        `${textSummary ? `, text="${textSummary}"` : ""}).`
+                );
+                return this._sendErrorResponse(res, 502, "No audio data returned by the TTS model.");
+            }
+
+            const audioResult = await AudioConverter.convertAudioParts(audioParts, responseFormat, this.logger);
+            if (!this._isResponseWritable(res)) {
+                this.logger.debug("[Request] Client connection closed before OpenAI TTS audio response was sent.");
+                return;
+            }
+
+            this.logger.info(
+                `✅ [Request] OpenAI TTS response ready: format=${audioResult.format}, ` +
+                    `contentType=${audioResult.contentType}, bytes=${audioResult.buffer.length}`
+            );
+
+            res.status(200)
+                .set({
+                    "Content-Length": String(audioResult.buffer.length),
+                    "Content-Type": audioResult.contentType,
+                })
+                .send(audioResult.buffer);
+        } catch (error) {
+            this._handleQueueTimeout(error, requestId);
+            this._handleRequestError(error, res, "openai");
+        } finally {
+            this.connectionRegistry.removeMessageQueue(requestId, "request_complete");
+            if (!res.writableEnded) res.end();
+        }
+    }
+
+    async _handleEdgeTtsSpeechRequest(req, res) {
+        try {
+            const audioResult = await EdgeTtsService.synthesize({
+                defaultVoice: this.config.edgeTtsDefaultVoice,
+                input: req.body.input,
+                logger: this.logger,
+                responseFormat: req.body.response_format,
+                speed: req.body.speed,
+                voice: req.body.voice,
+            });
+
+            if (!this._isResponseWritable(res)) {
+                this.logger.debug("[Request] Client connection closed before Edge-TTS audio response was sent.");
+                return;
+            }
+
+            this.logger.info(
+                `✅ [Request] Edge-TTS response ready: voice=${audioResult.voice}, rate=${audioResult.rate}, ` +
+                    `format=${audioResult.format}, bytes=${audioResult.buffer.length}`
+            );
+
+            res.status(200)
+                .set({
+                    "Content-Length": String(audioResult.buffer.length),
+                    "Content-Type": audioResult.contentType,
+                })
+                .send(audioResult.buffer);
+        } catch (error) {
+            this.logger.error(`[Request] Edge-TTS synthesis failed: ${error.message}`);
+            this._sendErrorResponse(res, 502, `Edge-TTS synthesis failed: ${error.message}`);
+        } finally {
             if (!res.writableEnded) res.end();
         }
     }

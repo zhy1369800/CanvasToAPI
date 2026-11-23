@@ -254,6 +254,10 @@ class ProxyServerSystem extends EventEmitter {
             this.requestHandler.processClaudeRequest(req, res);
         });
 
+        app.post("/v1/audio/speech", (req, res) => {
+            this.requestHandler.processOpenAISpeechRequest(req, res);
+        });
+
         // Browser-session WebSocket downgrade / missing headers handler.
         // If a proxy strips Upgrade headers, the request may arrive as a normal GET.
         app.get(this.config.browserWsPath, (req, res) => {

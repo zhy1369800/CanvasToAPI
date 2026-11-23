@@ -651,7 +651,6 @@
             this.reconnectAttempts = 0;
             this.reconnectTimer = null;
             this.heartbeatTimer = null;
-            this.isRetrying401 = false;
             this.manualDisconnect = false;
             this.shouldReconnect = true;
         }
@@ -936,15 +935,26 @@
 
                     let response = await fetch(requestUrl, requestConfig);
 
-                    if (response.status === 401 && !this.isRetrying401) {
-                        this.isRetrying401 = true;
-                        Logger.warn("Detect 401 error, attempting to re-authenticate and retry...");
-                        this._sendAuthMessage();
-                        await new Promise(resolve => setTimeout(resolve, 800));
+                    if (response.status === 401) {
+                        Logger.warn("Detect 401 error, waiting 800ms before retrying once...");
+                        await new Promise((resolve, reject) => {
+                            if (abortController.signal.aborted) {
+                                reject(new DOMException("The user aborted a request.", "AbortError"));
+                                return;
+                            }
+                            const onAbort = () => {
+                                clearTimeout(retryTimer);
+                                reject(new DOMException("The user aborted a request.", "AbortError"));
+                            };
+                            const retryTimer = setTimeout(() => {
+                                abortController.signal.removeEventListener("abort", onAbort);
+                                resolve();
+                            }, 800);
+                            abortController.signal.addEventListener("abort", onAbort, { once: true });
+                        });
                         response = await fetch(requestUrl, requestConfig);
-                        this.isRetrying401 = false;
                         if (response.ok) {
-                            Logger.output("Retry successful after 401 re-authentication!");
+                            Logger.output("Retry successful after 401 error!");
                         }
                     }
 
