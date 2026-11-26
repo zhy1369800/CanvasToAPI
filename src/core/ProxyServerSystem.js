@@ -17,6 +17,7 @@ const RequestHandler = require("./RequestHandler");
 const SessionRegistry = require("./SessionRegistry");
 const ConfigLoader = require("../utils/ConfigLoader");
 const WebRoutes = require("../routes/WebRoutes");
+const EdgeTtsService = require("../utils/EdgeTtsService");
 
 class ProxyServerSystem extends EventEmitter {
     constructor() {
@@ -378,6 +379,7 @@ class ProxyServerSystem extends EventEmitter {
 
         this.sessionRegistry.closeAllMessageQueues();
         this.sessionRegistry.closeAllConnections();
+        EdgeTtsService.closeAll();
 
         const closeServer = (server, name) =>
             new Promise(resolve => {

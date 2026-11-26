@@ -9,6 +9,8 @@ const EDGE_WSS_URL = "wss://api.msedgeservices.com/tts/cognitiveservices/websock
 const EDGE_SEC_MS_GEC_VERSION = "2-143.0.3650.96";
 const DEFAULT_EDGE_VOICE = "zh-CN-XiaoxiaoNeural";
 const SYNTHESIS_TIMEOUT_MS = 30000;
+const IDLE_CONNECTION_TIMEOUT_MS = 60000;
+const MAX_CONNECTION_USES = 100;
 
 // Route msedge-tts through Microsoft's current production WSS endpoint
 MsEdgeTTS.WSS_URL = EDGE_WSS_URL;
@@ -20,6 +22,157 @@ MsEdgeTTS.getSynthUrl = async function getSynthUrl() {
         `&Sec-MS-GEC=${secMsGec}&Sec-MS-GEC-Version=${EDGE_SEC_MS_GEC_VERSION}&ConnectionId=${requestId}`
     );
 };
+
+/**
+ * Voice connection pool to enable WebSocket connection reuse across requests.
+ * Key: voiceName (e.g. "zh-CN-XiaoxiaoNeural")
+ * Value: {
+ *   tts: MsEdgeTTS,
+ *   voice: string,
+ *   createdAt: number,
+ *   lastUsedAt: number,
+ *   useCount: number,
+ *   inFlightCount: number,
+ *   idleTimer: TimeoutHandle,
+ *   initPromise: Promise<void>
+ * }
+ */
+const connectionPool = new Map();
+
+/**
+ * Safely dispose a cached TTS instance.
+ * @param {string} voiceName
+ * @param {string} [reason=""]
+ * @param {object} [logger=null]
+ */
+function disposeInstance(voiceName, reason = "", logger = null) {
+    const entry = connectionPool.get(voiceName);
+    if (!entry) return;
+
+    connectionPool.delete(voiceName);
+
+    if (entry.idleTimer) {
+        clearTimeout(entry.idleTimer);
+        entry.idleTimer = null;
+    }
+
+    if (logger && reason) {
+        logger.debug(`[EdgeTTS] Disposed connection for ${voiceName}: ${reason}`);
+    }
+
+    try {
+        entry.tts.close();
+    } catch {
+        // Ignore cleanup errors on already-closed sockets
+    }
+}
+
+/**
+ * Acquire an active MsEdgeTTS instance for the given voice from the connection pool.
+ * Reuses existing WebSocket connection if open and healthy.
+ * @param {string} voiceName
+ * @param {object} [logger=null]
+ * @returns {Promise<MsEdgeTTS>}
+ */
+async function acquireTtsInstance(voiceName, logger = null) {
+    let entry = connectionPool.get(voiceName);
+
+    if (entry) {
+        if (entry.initPromise) {
+            try {
+                await entry.initPromise;
+            } catch {
+                // If parallel initialization failed, dispose will be triggered by that caller
+            }
+            entry = connectionPool.get(voiceName);
+        }
+
+        if (entry) {
+            const isSocketOpen = entry.tts?._ws && entry.tts._ws.readyState === 1;
+            const isExpired = entry.useCount >= MAX_CONNECTION_USES;
+
+            if (isSocketOpen && !isExpired) {
+                if (entry.idleTimer) {
+                    clearTimeout(entry.idleTimer);
+                    entry.idleTimer = null;
+                }
+                entry.useCount++;
+                entry.inFlightCount++;
+                entry.lastUsedAt = Date.now();
+                return entry.tts;
+            }
+
+            disposeInstance(voiceName, isExpired ? "Max uses reached" : "Socket closed or not open", logger);
+        }
+    }
+
+    const tts = new MsEdgeTTS({
+        connectionTimeoutMs: 10000,
+        synthesisTimeoutMs: 25000,
+    });
+
+    const newEntry = {
+        createdAt: Date.now(),
+        idleTimer: null,
+        inFlightCount: 1,
+        initPromise: null,
+        lastUsedAt: Date.now(),
+        tts,
+        useCount: 1,
+        voice: voiceName,
+    };
+
+    connectionPool.set(voiceName, newEntry);
+
+    try {
+        newEntry.initPromise = tts.setMetadata(voiceName, OUTPUT_FORMAT.AUDIO_24KHZ_96KBITRATE_MONO_MP3);
+        await newEntry.initPromise;
+        newEntry.initPromise = null;
+        logger?.debug(`[EdgeTTS] Established new pooled connection for voice: ${voiceName}`);
+        return tts;
+    } catch (error) {
+        disposeInstance(voiceName, `Failed to establish connection: ${error.message}`, logger);
+        throw error;
+    }
+}
+
+/**
+ * Release the instance after synthesis attempt.
+ * @param {string} voiceName
+ * @param {Error|null} error
+ * @param {object} [logger=null]
+ */
+function releaseTtsInstance(voiceName, error = null, logger = null) {
+    const entry = connectionPool.get(voiceName);
+    if (!entry) return;
+
+    entry.inFlightCount = Math.max(0, entry.inFlightCount - 1);
+    entry.lastUsedAt = Date.now();
+
+    if (error) {
+        disposeInstance(voiceName, `Synthesis error occurred (${error.message})`, logger);
+        return;
+    }
+
+    if (entry.idleTimer) {
+        clearTimeout(entry.idleTimer);
+    }
+
+    entry.idleTimer = setTimeout(() => {
+        if (entry.inFlightCount === 0) {
+            disposeInstance(voiceName, `Idle timeout (${IDLE_CONNECTION_TIMEOUT_MS}ms)`, logger);
+        }
+    }, IDLE_CONNECTION_TIMEOUT_MS);
+}
+
+/**
+ * Close all active pooled connections.
+ */
+function closeAll() {
+    for (const [voiceName] of connectionPool) {
+        disposeInstance(voiceName, "Global closeAll");
+    }
+}
 
 // OpenAI voice names mapped to Chinese/bilingual neural voices by default
 const OPENAI_VOICE_TO_EDGE_MAP = {
@@ -92,24 +245,21 @@ function escapeXml(text) {
 }
 
 /**
- * Execute a single Edge-TTS synthesis attempt with isolated connection and timeout cleanup.
+ * Execute a single Edge-TTS synthesis attempt using pooled connection.
  * @param {string} escapedText
  * @param {string} voiceName
  * @param {string} rate
+ * @param {object} [logger=null]
  * @returns {Promise<Buffer>}
  */
-async function synthesizeOnce(escapedText, voiceName, rate) {
-    const tts = new MsEdgeTTS({
-        connectionTimeoutMs: 10000,
-        synthesisTimeoutMs: 25000,
-    });
-
+async function synthesizeOnce(escapedText, voiceName, rate, logger = null) {
+    const tts = await acquireTtsInstance(voiceName, logger);
     let timeoutHandle = null;
     let audioStream = null;
+    let synthesisError = null;
 
     try {
         const synthPromise = (async () => {
-            await tts.setMetadata(voiceName, OUTPUT_FORMAT.AUDIO_24KHZ_96KBITRATE_MONO_MP3);
             const streamResult = tts.toStream(escapedText, { rate });
             audioStream = streamResult.audioStream;
 
@@ -137,15 +287,14 @@ async function synthesizeOnce(escapedText, voiceName, rate) {
         });
 
         return await Promise.race([synthPromise, timeoutPromise]);
+    } catch (error) {
+        synthesisError = error;
+        throw error;
     } finally {
         if (timeoutHandle) {
             clearTimeout(timeoutHandle);
         }
-        try {
-            tts.close();
-        } catch {
-            // Ignore cleanup errors on already-closed sockets
-        }
+        releaseTtsInstance(voiceName, synthesisError, logger);
     }
 }
 
@@ -184,7 +333,7 @@ async function synthesize({
     let lastError = null;
     for (let attempt = 1; attempt <= 2; attempt++) {
         try {
-            const buffer = await synthesizeOnce(escapedText, resolvedVoice, rate);
+            const buffer = await synthesizeOnce(escapedText, resolvedVoice, rate, logger);
             return {
                 buffer,
                 contentType: "audio/mpeg",
@@ -195,8 +344,12 @@ async function synthesize({
         } catch (error) {
             lastError = error;
             if (attempt < 2) {
-                logger?.warn(`[EdgeTTS] Synthesis attempt ${attempt} failed (${error.message}), retrying once...`);
-                await new Promise(resolve => setTimeout(resolve, 500));
+                const is429 = error.message?.includes("429");
+                const backoffDelay = is429 ? 1200 : 500;
+                logger?.warn(
+                    `[EdgeTTS] Synthesis attempt ${attempt} failed (${error.message}), retrying in ${backoffDelay}ms...`
+                );
+                await new Promise(resolve => setTimeout(resolve, backoffDelay));
             }
         }
     }
@@ -205,6 +358,7 @@ async function synthesize({
 }
 
 module.exports = {
+    closeAll,
     escapeXml,
     OPENAI_VOICE_TO_EDGE_MAP,
     resolveRate,
