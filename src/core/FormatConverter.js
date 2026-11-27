@@ -1793,23 +1793,17 @@ class FormatConverter {
                             output_index: messageItem.output_index,
                         });
                     } else if (part?.inlineData) {
-                        // This proxy intentionally does not expose image outputs in Responses API because many
-                        // clients treat `image_generation_call` as a hosted tool call and may initiate a second
-                        // tool-execution roundtrip that Gemini image models cannot support (function calling).
-                        // Emit a one-time text note so clients don't get an empty response.
-                        if (!streamState.imageOutputSuppressedNoticeSent) {
-                            streamState.imageOutputSuppressedNoticeSent = true;
-                            const messageItem = ensureMessageItem();
-                            const note =
-                                "[Image output omitted: Responses API image outputs are disabled by this proxy.]";
-                            streamState.messageText += note;
-                            pushEvent("response.output_text.delta", {
-                                content_index: messageItem.content_index,
-                                delta: note,
-                                item_id: messageItem.id,
-                                output_index: messageItem.output_index,
-                            });
-                        }
+                        const image = part.inlineData;
+                        const imageMarkdown = `![Generated Image](data:${image.mimeType};base64,${image.data})`;
+                        const messageItem = ensureMessageItem();
+                        streamState.messageText += imageMarkdown;
+                        this.logger.info("[Adapter] Successfully emitted image in Responses API streaming chunk.");
+                        pushEvent("response.output_text.delta", {
+                            content_index: messageItem.content_index,
+                            delta: imageMarkdown,
+                            item_id: messageItem.id,
+                            output_index: messageItem.output_index,
+                        });
                     } else if (part?.functionCall) {
                         const funcCall = part.functionCall;
                         const itemId = `fc_${this._generateRequestId()}`;
@@ -2111,11 +2105,10 @@ class FormatConverter {
                     // Regular text content
                     messageContent += part.text;
                 } else if (part.inlineData) {
-                    // Responses API image outputs are intentionally suppressed by this proxy; preserve a text note.
-                    if (!messageContent) {
-                        messageContent =
-                            "[Image output omitted: Responses API image outputs are disabled by this proxy.]";
-                    }
+                    const image = part.inlineData;
+                    const imageMarkdown = `![Generated Image](data:${image.mimeType};base64,${image.data})`;
+                    messageContent += imageMarkdown;
+                    this.logger.info("[Adapter] Successfully included image in Responses API non-streaming output.");
                 } else if (part.functionCall) {
                     // Function call
                     const funcCall = part.functionCall;
